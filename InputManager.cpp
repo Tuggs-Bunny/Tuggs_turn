@@ -5,6 +5,7 @@
 #include <poll.h>
 #include <dirent.h>
 #include <cstring>
+#include <algorithm>
 #include <chrono>
 
 namespace {
@@ -45,56 +46,100 @@ int InputManager::detectNextKey() {
     return code;
 }
 
-void InputManager::scanDevices(std::vector<struct pollfd>& fds) {
-    for (auto& p : fds) close(p.fd);
-    fds.clear();
-
+// Opens event nodes we don't have open yet. Never touches devices that are
+// already open: closing a live fd can swallow a release event and leave a
+// bind stuck down.
+void InputManager::scanNewDevices(std::vector<Device>& devices) {
     DIR* dir = opendir("/dev/input");
     if (!dir) return;
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {
         if (strncmp(entry->d_name, "event", 5) != 0) continue;
         std::string path = std::string("/dev/input/") + entry->d_name;
+        bool known = std::any_of(devices.begin(), devices.end(),
+                                 [&](const Device& d) { return d.path == path; });
+        if (known) continue;
         int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK);
         if (fd < 0) continue;
         if (!hasKeyEvents(fd)) {
             close(fd);
             continue;
         }
-        fds.push_back({ fd, POLLIN, 0 });
+        devices.push_back({ fd, path });
     }
     closedir(dir);
-    deviceCount_ = static_cast<int>(fds.size());
+    deviceCount_ = static_cast<int>(devices.size());
+}
+
+// Rebuilds the state array from the kernel's authoritative key bitmap
+// (EVIOCGKEY). Any release we somehow missed gets corrected here, so a
+// stuck key can never outlive one resync interval.
+void InputManager::resyncState(const std::vector<Device>& devices) {
+    unsigned char merged[MAX_CODE / 8] = {};
+    for (const auto& d : devices) {
+        unsigned char bits[MAX_CODE / 8] = {};
+        if (ioctl(d.fd, EVIOCGKEY(sizeof(bits)), bits) < 0) continue;
+        for (size_t i = 0; i < sizeof(bits); ++i) merged[i] |= bits[i];
+    }
+    for (int code = 0; code < MAX_CODE; ++code) {
+        bool down = (merged[code / 8] >> (code % 8)) & 1;
+        state_[code].store(down, std::memory_order_relaxed);
+    }
 }
 
 void InputManager::readerLoop() {
-    std::vector<struct pollfd> fds;
-    scanDevices(fds);
+    std::vector<Device> devices;
+    scanNewDevices(devices);
+    resyncState(devices);
     auto lastScan = std::chrono::steady_clock::now();
+    auto lastResync = lastScan;
+
+    std::vector<struct pollfd> fds;
 
     while (shouldRun_) {
-        // rescan periodically to pick up hotplugged devices
         auto now = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::seconds>(now - lastScan).count() >= 5) {
-            scanDevices(fds);
+            scanNewDevices(devices);
             lastScan = now;
         }
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastResync).count() >= 500) {
+            resyncState(devices);
+            lastResync = now;
+        }
 
-        if (fds.empty()) {
+        if (devices.empty()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             continue;
         }
 
+        fds.clear();
+        for (const auto& d : devices) fds.push_back({ d.fd, POLLIN, 0 });
+
         int ret = poll(fds.data(), fds.size(), 100);
         if (ret <= 0) continue;
 
-        for (auto& p : fds) {
-            if (!(p.revents & POLLIN)) continue;
+        std::vector<std::string> dead;
+        for (size_t di = 0; di < fds.size(); ++di) {
+            if (fds[di].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                dead.push_back(devices[di].path);
+                continue;
+            }
+            if (!(fds[di].revents & POLLIN)) continue;
             struct input_event ev[32];
-            ssize_t n = read(p.fd, ev, sizeof(ev));
+            ssize_t n = read(fds[di].fd, ev, sizeof(ev));
+            if (n < 0 && errno != EAGAIN) {
+                dead.push_back(devices[di].path);
+                continue;
+            }
             if (n < static_cast<ssize_t>(sizeof(struct input_event))) continue;
             int count = n / sizeof(struct input_event);
             for (int i = 0; i < count; ++i) {
+                if (ev[i].type == EV_SYN && ev[i].code == SYN_DROPPED) {
+                    // kernel dropped events; our tracked state may be stale
+                    resyncState(devices);
+                    lastResync = std::chrono::steady_clock::now();
+                    continue;
+                }
                 if (ev[i].type != EV_KEY) continue;
                 int code = ev[i].code;
                 if (code < 0 || code >= MAX_CODE) continue;
@@ -105,7 +150,21 @@ void InputManager::readerLoop() {
                 }
             }
         }
+
+        // drop unplugged devices (their held keys clear on next resync)
+        if (!dead.empty()) {
+            for (auto it = devices.begin(); it != devices.end();) {
+                if (std::find(dead.begin(), dead.end(), it->path) != dead.end()) {
+                    close(it->fd);
+                    it = devices.erase(it);
+                }
+                else ++it;
+            }
+            deviceCount_ = static_cast<int>(devices.size());
+            resyncState(devices);
+            lastResync = std::chrono::steady_clock::now();
+        }
     }
 
-    for (auto& p : fds) close(p.fd);
+    for (auto& d : devices) close(d.fd);
 }

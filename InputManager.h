@@ -21,8 +21,14 @@ public:
     int deviceCount() const { return static_cast<int>(deviceCount_); }
 
 private:
+    struct Device {
+        int fd;
+        std::string path;
+    };
+
     void readerLoop();
-    void scanDevices(std::vector<struct pollfd>& fds);
+    void scanNewDevices(std::vector<Device>& devices);
+    void resyncState(const std::vector<Device>& devices);
 
     static constexpr int MAX_CODE = 0x300;
     std::atomic<bool> state_[MAX_CODE];
